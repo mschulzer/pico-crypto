@@ -2,6 +2,7 @@ from ufastrsa.srandom import rndsrcnz
 from ufastrsa.genprime import pow3
 import ustruct as struct
 import ubinascii as binascii
+import ure as re
 
 
 class RSA:
@@ -50,8 +51,6 @@ class RSA:
 
     # Manually encode the public key (n, e) into ASN.1 DER format.
     def _encode_asn1_public_key(self):
-
-        # Keep these functions as inner functions to avoid polluting the namespace
         def encode_length(length):
             if length < 0x80:
                 return struct.pack("B", length)
@@ -63,25 +62,91 @@ class RSA:
                 raise ValueError("Length too long to encode.")
 
         def encode_integer(value):
-            # Compute the byte length of the integer manually
             value_bytes = []
             while value > 0:
                 value_bytes.insert(0, value & 0xFF)
                 value >>= 8
             value_bytes = bytes(value_bytes)
-            # Add a zero-byte if the most significant bit is set (to ensure positive integer)
             if len(value_bytes) > 0 and value_bytes[0] & 0x80:
                 value_bytes = b"\x00" + value_bytes
             return b"\x02" + encode_length(len(value_bytes)) + value_bytes
 
-        # Encode modulus (n) and exponent (e) as SEQUENCE
         modulus = encode_integer(self.n)
         exponent = encode_integer(self.e)
         sequence = b"\x30" + encode_length(len(modulus) + len(exponent)) + modulus + exponent
 
-        # Wrap in BIT STRING and algorithm identifier SEQUENCE
-        algorithm_identifier = b"\x30\x0D\x06\x09\x2A\x86\x48\x86\xF7\x0D\x01\x01\x01\x05\x00"  # rsaEncryption OID
+        algorithm_identifier = b"\x30\x0D\x06\x09\x2A\x86\x48\x86\xF7\x0D\x01\x01\x01\x05\x00"
         public_key_bitstring = b"\x03" + encode_length(len(sequence) + 1) + b"\x00" + sequence
         public_key_sequence = b"\x30" + encode_length(len(algorithm_identifier) + len(public_key_bitstring)) + algorithm_identifier + public_key_bitstring
 
         return public_key_sequence
+
+    @classmethod
+    def import_public_key_from_pem(cls, pem_data):
+        """
+        Imports a PEM-encoded RSA public key, extracts modulus (n) and exponent (e),
+        and returns an RSA object initialized with these values.
+        """
+
+        pem_data = re.sub(r"-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\s", "", pem_data)
+
+        # Decode from Base64
+        der_data = binascii.a2b_base64(pem_data)
+
+        # Function to parse ASN.1 structure
+        def parse_asn1(data):
+            """ Extracts modulus and exponent from ASN.1 sequence. """
+            def read_length(data, offset):
+                length = data[offset]
+                offset += 1
+                if length & 0x80:
+                    num_bytes = length & 0x7F
+                    length = int.from_bytes(data[offset:offset+num_bytes], "big")
+                    offset += num_bytes
+                return length, offset
+
+            def read_integer(data, offset):
+                """ ASN.1 INTEGER. """
+                if data[offset] != 0x02:
+                    raise ValueError("ASN.1 format error: Expected INTEGER tag.")
+                length, offset = read_length(data, offset + 1)
+                value = int.from_bytes(data[offset:offset+length], "big")
+                offset += length
+                return value, offset
+
+            if data[0] != 0x30:
+                raise ValueError("Invalid ASN.1 format: Expected SEQUENCE.")
+
+            _, offset = read_length(data, 1)  # Skip length
+
+            # Algorithm Identifier (rsaEncryption OID: 1.2.840.113549.1.1.1)
+            if data[offset:offset+15] != b"\x30\x0D\x06\x09\x2A\x86\x48\x86\xF7\x0D\x01\x01\x01\x05\x00":
+                raise ValueError("Invalid RSA key format.")
+
+            offset += 15  # Skip Algorithm Identifier
+
+            if data[offset] != 0x03:
+                raise ValueError("Invalid ASN.1 format: Expected BIT STRING.")
+
+            _, offset = read_length(data, offset + 1)
+            offset += 1  # Skip unused bits indicator
+
+            if data[offset] != 0x30:
+                raise ValueError("Invalid ASN.1 format: Expected nested SEQUENCE.")
+
+            _, offset = read_length(data, offset + 1)
+
+            # Extract modulus (n)
+            modulus, offset = read_integer(data, offset)
+
+            # Extract exponent (e)
+            exponent, offset = read_integer(data, offset)
+
+            return modulus, exponent
+
+        # Extract key components
+        n, e = parse_asn1(der_data)
+
+        # Return an RSA object with the public key initialized
+        return cls(bits=512, n=n, e=e)
+
